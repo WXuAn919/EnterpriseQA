@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 
-import { askQuestionApi, getMessagesApi, getSessionsApi } from '@/api/chat'
+import { getMessagesApi, getSessionsApi, streamQuestionApi } from '@/api/chat'
 import { getKnowledgeBaseListApi } from '@/api/knowledge'
 
 const loading = ref(false)
@@ -15,7 +15,27 @@ const form = reactive({
   sessionId: '',
 })
 
-/** 加载知识库下拉选项。 */
+function normalizeMessage(message) {
+  return {
+    ...message,
+    sources: Array.isArray(message.sources) ? message.sources : [],
+    streaming: false,
+    failed: false,
+  }
+}
+
+function createPendingMessage(question) {
+  return reactive({
+    id: `pending-${Date.now()}`,
+    question,
+    answer: '',
+    sources: [],
+    elapsedMs: 0,
+    streaming: true,
+    failed: false,
+  })
+}
+
 async function loadKnowledgeBases() {
   const response = await getKnowledgeBaseListApi()
   knowledgeBases.value = response.data
@@ -24,45 +44,73 @@ async function loadKnowledgeBases() {
   }
 }
 
-/** 拉取当前用户历史会话。 */
 async function loadSessions() {
   const response = await getSessionsApi()
   sessions.value = response.data
 }
 
-/** 切换会话后加载历史消息。 */
 async function loadMessages(sessionId) {
   if (!sessionId) {
     messages.value = []
     return
   }
+
   const response = await getMessagesApi({ sessionId })
-  messages.value = response.data
+  messages.value = response.data.map(normalizeMessage)
 }
 
-/** 提交问题并将新消息显示在页面上。 */
 async function handleAsk() {
   if (!form.knowledgeBaseId) {
     ElMessage.warning('请选择知识库')
     return
   }
-  if (!form.question.trim()) {
+
+  const question = form.question.trim()
+  if (!question) {
     ElMessage.warning('请输入问题内容')
     return
   }
 
+  const pendingMessage = createPendingMessage(question)
+  messages.value = [...messages.value, pendingMessage]
+  form.question = ''
   loading.value = true
-  try {
-    const response = await askQuestionApi({
-      knowledgeBaseId: form.knowledgeBaseId,
-      sessionId: form.sessionId || null,
-      question: form.question,
-    })
 
-    form.sessionId = response.data.sessionId
-    form.question = ''
+  try {
+    await streamQuestionApi(
+      {
+        knowledgeBaseId: form.knowledgeBaseId,
+        sessionId: form.sessionId || null,
+        question,
+      },
+      {
+        onStart(data) {
+          if (data?.sessionId) {
+            form.sessionId = data.sessionId
+          }
+        },
+        onContext(data) {
+          pendingMessage.sources = data?.sources || []
+        },
+        onChunk(chunk) {
+          pendingMessage.answer += chunk
+        },
+        onComplete(data) {
+          pendingMessage.id = data?.messageId || pendingMessage.id
+          pendingMessage.answer = data?.answer || pendingMessage.answer
+          pendingMessage.sources = data?.sources || pendingMessage.sources
+          pendingMessage.elapsedMs = data?.elapsedMs || 0
+          pendingMessage.streaming = false
+        },
+      },
+    )
+
     await loadSessions()
-    await loadMessages(form.sessionId)
+  } catch (error) {
+    pendingMessage.answer = error.message || '问答失败，请稍后重试'
+    pendingMessage.streaming = false
+    pendingMessage.failed = true
+    ElMessage.error(error.message || '问答失败，请稍后重试')
   } finally {
     loading.value = false
   }
@@ -118,7 +166,7 @@ onMounted(async () => {
         <el-input
           v-model="form.question"
           :rows="4"
-          placeholder="请输入你的问题，例如：公司办公时间是什么？"
+          placeholder="请输入你的问题，例如：公司的办公时间是什么？"
           type="textarea"
         />
         <div class="composer-card__footer">
@@ -134,12 +182,17 @@ onMounted(async () => {
             <p>{{ message.question }}</p>
           </div>
 
-          <div class="bubble bubble--answer">
+          <div class="bubble bubble--answer" :class="{ 'bubble--failed': message.failed }">
             <div class="bubble__top">
               <h4>知识库回答</h4>
-              <span>{{ message.elapsedMs }} ms</span>
+              <span v-if="message.streaming">生成中...</span>
+              <span v-else-if="message.failed">生成失败</span>
+              <span v-else>{{ message.elapsedMs }} ms</span>
             </div>
-            <p>{{ message.answer }}</p>
+            <p class="answer-text">
+              {{ message.answer }}
+              <span v-if="message.streaming" class="streaming-cursor" />
+            </p>
 
             <div v-if="message.sources?.length" class="source-box">
               <h5>命中来源</h5>
@@ -288,9 +341,28 @@ onMounted(async () => {
   background: linear-gradient(145deg, #f9fbff, #edf5ff);
 }
 
+.bubble--failed {
+  background: linear-gradient(145deg, #fff8f8, #ffeaea);
+}
+
 .bubble__top span {
   color: #7e90a8;
   font-size: 12px;
+}
+
+.answer-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1.1em;
+  margin-left: 4px;
+  vertical-align: text-bottom;
+  background: #3a7afe;
+  animation: pulse 1s infinite;
 }
 
 .source-box {
@@ -312,6 +384,18 @@ onMounted(async () => {
   color: #7d8fa8;
   text-align: center;
   padding: 24px 0;
+}
+
+@keyframes pulse {
+  0%,
+  49% {
+    opacity: 1;
+  }
+
+  50%,
+  100% {
+    opacity: 0.15;
+  }
 }
 
 @media (max-width: 1100px) {

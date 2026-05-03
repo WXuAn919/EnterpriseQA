@@ -1,8 +1,10 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
+export const API_BASE_URL = 'http://127.0.0.1:5000'
+
 const http = axios.create({
-  baseURL: 'http://127.0.0.1:5000',
+  baseURL: API_BASE_URL,
   timeout: 30000,
 })
 
